@@ -1,111 +1,101 @@
 /**
- * Memory Budget Manager
+ * Inference Budget Tracker
  *
- * Manages token budget allocation for memory retrieval.
- * Trims memory retrieval results to fit within configured budgets.
+ * Tracks inference costs and enforces budget limits per call,
+ * per hour, per session, and per day.
  */
 
-import type { MemoryBudget, MemoryRetrievalResult } from "../types.js";
-import { estimateTokens } from "../agent/context.js";
+import type BetterSqlite3 from "better-sqlite3";
+import { ulid } from "ulid";
+import type { InferenceCostRow, ModelStrategyConfig } from "../types.js";
+import {
+  inferenceInsertCost,
+  inferenceGetSessionCosts,
+  inferenceGetDailyCost,
+  inferenceGetHourlyCost,
+  inferenceGetModelCosts,
+} from "../state/database.js";
 
-export class MemoryBudgetManager {
-  constructor(private budget: MemoryBudget) {}
+type Database = BetterSqlite3.Database;
 
-  /**
-   * Allocate memories within budget, trimming each tier as needed.
-   * Returns a new MemoryRetrievalResult that fits within the budget.
-   */
-  allocate(memories: MemoryRetrievalResult): MemoryRetrievalResult {
-    let totalTokens = 0;
+export class InferenceBudgetTracker {
+  private db: Database;
+  readonly config: ModelStrategyConfig;
 
-    // Working memory tier
-    const { items: workingMemory, tokens: workingTokens } = this.trimTier(
-      memories.workingMemory,
-      this.budget.workingMemoryTokens,
-      (entry) => estimateTokens(entry.content),
-    );
-    totalTokens += workingTokens;
-
-    // Episodic memory tier
-    const { items: episodicMemory, tokens: episodicTokens } = this.trimTier(
-      memories.episodicMemory,
-      this.budget.episodicMemoryTokens,
-      (entry) => estimateTokens(entry.summary + (entry.detail || "")),
-    );
-    totalTokens += episodicTokens;
-
-    // Semantic memory tier
-    const { items: semanticMemory, tokens: semanticTokens } = this.trimTier(
-      memories.semanticMemory,
-      this.budget.semanticMemoryTokens,
-      (entry) => estimateTokens(`${entry.category}/${entry.key}: ${entry.value}`),
-    );
-    totalTokens += semanticTokens;
-
-    // Procedural memory tier
-    const { items: proceduralMemory, tokens: proceduralTokens } = this.trimTier(
-      memories.proceduralMemory,
-      this.budget.proceduralMemoryTokens,
-      (entry) => estimateTokens(`${entry.name}: ${entry.description} (${entry.steps.length} steps)`),
-    );
-    totalTokens += proceduralTokens;
-
-    // Relationship memory tier
-    const { items: relationships, tokens: relationshipTokens } = this.trimTier(
-      memories.relationships,
-      this.budget.relationshipMemoryTokens,
-      (entry) => estimateTokens(`${entry.entityAddress}: ${entry.relationshipType} trust=${entry.trustScore}`),
-    );
-    totalTokens += relationshipTokens;
-
-    return {
-      workingMemory,
-      episodicMemory,
-      semanticMemory,
-      proceduralMemory,
-      relationships,
-      totalTokens,
-    };
+  constructor(db: Database, config: ModelStrategyConfig) {
+    this.db = db;
+    this.config = config;
   }
 
   /**
-   * Estimate token count for a text string.
+   * Check whether a call with estimated cost is within budget.
+   * Returns { allowed: true } or { allowed: false, reason: "..." }.
    */
-  estimateTokens(text: string): number {
-    return estimateTokens(text);
-  }
-
-  /**
-   * Get total budget across all tiers.
-   */
-  getTotalBudget(): number {
-    return (
-      this.budget.workingMemoryTokens +
-      this.budget.episodicMemoryTokens +
-      this.budget.semanticMemoryTokens +
-      this.budget.proceduralMemoryTokens +
-      this.budget.relationshipMemoryTokens
-    );
-  }
-
-  /**
-   * Trim a tier's items to fit within a token budget.
-   */
-  private trimTier<T>(
-    items: T[],
-    budgetTokens: number,
-    estimateFn: (item: T) => number,
-  ): { items: T[]; tokens: number } {
-    const result: T[] = [];
-    let tokens = 0;
-
-    for (const item of items) {
-      const itemTokens = estimateFn(item);
-      if (tokens + itemTokens > budgetTokens) break;
-      result.push(item);
-      tokens += itemTokens;
+  checkBudget(
+    estimatedCostCents: number,
+    model: string,
+  ): { allowed: boolean; reason?: string } {
+    // Per-call ceiling check
+    if (this.config.perCallCeilingCents > 0 && estimatedCostCents > this.config.perCallCeilingCents) {
+      return {
+        allowed: false,
+        reason: `Per-call cost ${estimatedCostCents}c exceeds ceiling of ${this.config.perCallCeilingCents}c`,
+      };
     }
 
-    return { items: result, tokens };
+    // Hourly budget check
+    if (this.config.hourlyBudgetCents > 0) {
+      const hourlyCost = this.getHourlyCost();
+      if (hourlyCost + estimatedCostCents > this.config.hourlyBudgetCents) {
+        return {
+          allowed: false,
+          reason: `Hourly budget exhausted: ${hourlyCost}c spent + ${estimatedCostCents}c estimated > ${this.config.hourlyBudgetCents}c limit`,
+        };
+      }
+    }
+
+    // Session budget check
+    if (this.config.sessionBudgetCents > 0) {
+      // Session budget is enforced via getSessionCost when sessionId is known
+      // This is a guard for the overall session — enforced in router.route()
+    }
+
+    return { allowed: true };
+  }
+
+  /**
+   * Record a completed inference cost.
+   */
+  recordCost(cost: Omit<InferenceCostRow, "id" | "createdAt">): void {
+    inferenceInsertCost(this.db, cost);
+  }
+
+  /**
+   * Get total cost for the current hour.
+   */
+  getHourlyCost(): number {
+    return inferenceGetHourlyCost(this.db);
+  }
+
+  /**
+   * Get total cost for today (or a specific date).
+   */
+  getDailyCost(date?: string): number {
+    return inferenceGetDailyCost(this.db, date);
+  }
+
+  /**
+   * Get total cost for a specific session.
+   */
+  getSessionCost(sessionId: string): number {
+    const costs = inferenceGetSessionCosts(this.db, sessionId);
+    return costs.reduce((sum, c) => sum + c.costCents, 0);
+  }
+
+  /**
+   * Get cost breakdown for a specific model.
+   */
+  getModelCosts(model: string, days?: number): { totalCents: number; callCount: number } {
+    return inferenceGetModelCosts(this.db, model, days);
   }
 }

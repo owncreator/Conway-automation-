@@ -1,231 +1,189 @@
 /**
- * Skills Registry
+ * Model Registry
  *
- * Install skills from remote sources:
- * - Git repos: git clone <url> ~/.automaton/skills/<name>
- * - URLs: fetch a SKILL.md from any URL
- * - Self-created: the automaton writes its own SKILL.md files
- *
- * All shell commands use execFileSync with argument arrays to prevent injection.
- * Directory operations use fs.* to avoid shell interpolation entirely.
+ * DB-backed registry of available models with capabilities and pricing.
+ * Seeded from a static baseline, updatable at runtime from Conway API.
  */
 
-import { execFileSync } from "child_process";
-import fs from "fs";
-import path from "path";
-import * as yaml from "yaml";
-import type {
-  Skill,
-  SkillSource,
-  AutomatonDatabase,
-  ConwayClient,
-} from "../types.js";
-import { parseSkillMd } from "./format.js";
+import type BetterSqlite3 from "better-sqlite3";
+import type { ModelEntry, ModelRegistryRow } from "../types.js";
+import { STATIC_MODEL_BASELINE } from "./types.js";
+import {
+  modelRegistryUpsert,
+  modelRegistryGet,
+  modelRegistryGetAll,
+  modelRegistryGetAvailable,
+  modelRegistrySetEnabled,
+} from "../state/database.js";
 
-// Validation patterns to prevent injection via path/URL arguments
-const SKILL_NAME_RE = /^[a-zA-Z0-9-]+$/;
-const SAFE_URL_RE = /^https?:\/\/[^\s;|&$`(){}<>]+$/;
+type Database = BetterSqlite3.Database;
 
-// Size limits for skill content
-const MAX_DESCRIPTION_LENGTH = 500;
-const MAX_INSTRUCTIONS_LENGTH = 10_000;
+const TIER_ORDER: Record<string, number> = {
+  dead: 0,
+  critical: 1,
+  low_compute: 2,
+  normal: 3,
+  high: 4,
+};
 
-/**
- * Validate that a skill path does not escape the skills directory.
- * Prevents path traversal attacks via crafted skill names.
- */
-function validateSkillPath(skillsDir: string, name: string): string {
-  const resolved = path.resolve(skillsDir, name);
-  if (!resolved.startsWith(path.resolve(skillsDir) + path.sep)) {
-    throw new Error(`Skill path traversal detected: ${name}`);
-  }
-  return resolved;
-}
+export class ModelRegistry {
+  private db: Database;
 
-/**
- * Install a skill from a git repository.
- * Clones the repo into ~/.automaton/skills/<name>/
- * Uses execFileSync with argument arrays to prevent shell injection.
- */
-export async function installSkillFromGit(
-  repoUrl: string,
-  name: string,
-  skillsDir: string,
-  db: AutomatonDatabase,
-  _conway: ConwayClient,
-): Promise<Skill | null> {
-  // Validate inputs to prevent injection
-  if (!SKILL_NAME_RE.test(name)) {
-    throw new Error(`Invalid skill name: "${name}". Must match ${SKILL_NAME_RE.source}`);
-  }
-  if (!SAFE_URL_RE.test(repoUrl)) {
-    throw new Error(`Invalid repo URL: "${repoUrl}". Must be an http(s) URL with no shell metacharacters.`);
+  constructor(db: Database) {
+    this.db = db;
   }
 
-  const resolvedDir = resolveHome(skillsDir);
-  const targetDir = validateSkillPath(resolvedDir, name);
+  /**
+   * Upsert the static model baseline into the registry on every startup.
+   * New models are added, existing models get updated pricing/capabilities,
+   * and models removed from the baseline are disabled.
+   */
+  initialize(): void {
+    const now = new Date().toISOString();
+    const baselineIds = new Set(STATIC_MODEL_BASELINE.map((m) => m.modelId));
 
-  // Clone using execFileSync with argument array (no shell interpolation)
-  try {
-    execFileSync("git", ["clone", "--depth", "1", repoUrl, targetDir], {
-      encoding: "utf-8",
-      timeout: 60_000,
-    });
-  } catch (err: any) {
-    throw new Error(`Failed to clone skill repo: ${err.message}`);
+    // Upsert all baseline models
+    for (const model of STATIC_MODEL_BASELINE) {
+      const existing = modelRegistryGet(this.db, model.modelId);
+      const row: ModelRegistryRow = {
+        modelId: model.modelId,
+        provider: model.provider,
+        displayName: model.displayName,
+        tierMinimum: model.tierMinimum,
+        costPer1kInput: model.costPer1kInput,
+        costPer1kOutput: model.costPer1kOutput,
+        maxTokens: model.maxTokens,
+        contextWindow: model.contextWindow,
+        supportsTools: model.supportsTools,
+        supportsVision: model.supportsVision,
+        parameterStyle: model.parameterStyle,
+        enabled: existing?.enabled ?? true,
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+      };
+      modelRegistryUpsert(this.db, row);
+    }
+
+    // Disable models no longer in the baseline (e.g., removed Anthropic models).
+    // Skip dynamically-discovered providers (e.g. ollama) — they manage their own lifecycle.
+    const allModels = modelRegistryGetAll(this.db);
+    for (const existing of allModels) {
+      if (
+        !baselineIds.has(existing.modelId) &&
+        existing.enabled &&
+        existing.provider !== "ollama" &&
+        existing.provider !== "other"
+      ) {
+        modelRegistrySetEnabled(this.db, existing.modelId, false);
+      }
+    }
   }
 
-  // Read SKILL.md using fs (no shell needed)
-  const skillMdPath = path.join(targetDir, "SKILL.md");
-  if (!fs.existsSync(skillMdPath)) {
-    throw new Error(`No SKILL.md found in cloned repo at ${skillMdPath}`);
+  /**
+   * Get a single model by ID.
+   */
+  get(modelId: string): ModelEntry | undefined {
+    const row = modelRegistryGet(this.db, modelId);
+    return row ? this.rowToEntry(row) : undefined;
   }
 
-  const content = fs.readFileSync(skillMdPath, "utf-8");
-  const skill = parseSkillMd(content, skillMdPath, "git");
-  if (!skill) {
-    throw new Error("Failed to parse SKILL.md from cloned repo");
+  /**
+   * Get all registered models.
+   */
+  getAll(): ModelEntry[] {
+    return modelRegistryGetAll(this.db).map((r) => this.rowToEntry(r));
   }
 
-  db.upsertSkill(skill);
-  return skill;
-}
-
-/**
- * Install a skill from a URL (fetches a single SKILL.md).
- * Uses execFileSync with argument arrays and fs.* for safe operations.
- */
-export async function installSkillFromUrl(
-  url: string,
-  name: string,
-  skillsDir: string,
-  db: AutomatonDatabase,
-  _conway: ConwayClient,
-): Promise<Skill | null> {
-  // Validate inputs to prevent injection
-  if (!SKILL_NAME_RE.test(name)) {
-    throw new Error(`Invalid skill name: "${name}". Must match ${SKILL_NAME_RE.source}`);
-  }
-  if (!SAFE_URL_RE.test(url)) {
-    throw new Error(`Invalid URL: "${url}". Must be an http(s) URL with no shell metacharacters.`);
+  /**
+   * Get available (enabled) models, optionally filtering by tier minimum.
+   */
+  getAvailable(tierMinimum?: string): ModelEntry[] {
+    return modelRegistryGetAvailable(this.db, tierMinimum).map((r) => this.rowToEntry(r));
   }
 
-  const resolvedDir = resolveHome(skillsDir);
-  const targetDir = validateSkillPath(resolvedDir, name);
-  const skillMdPath = path.join(targetDir, "SKILL.md");
-
-  // Create directory using fs (no shell needed)
-  fs.mkdirSync(targetDir, { recursive: true });
-
-  // Fetch SKILL.md using execFileSync with argument array (no shell interpolation)
-  try {
-    execFileSync("curl", ["-fsSL", "-o", skillMdPath, url], {
-      encoding: "utf-8",
-      timeout: 30_000,
-    });
-  } catch (err: any) {
-    throw new Error(`Failed to fetch SKILL.md from URL: ${err.message}`);
+  /**
+   * Insert or update a model entry.
+   */
+  upsert(entry: ModelEntry): void {
+    const row: ModelRegistryRow = {
+      modelId: entry.modelId,
+      provider: entry.provider,
+      displayName: entry.displayName,
+      tierMinimum: entry.tierMinimum,
+      costPer1kInput: entry.costPer1kInput,
+      costPer1kOutput: entry.costPer1kOutput,
+      maxTokens: entry.maxTokens,
+      contextWindow: entry.contextWindow,
+      supportsTools: entry.supportsTools,
+      supportsVision: entry.supportsVision,
+      parameterStyle: entry.parameterStyle,
+      enabled: entry.enabled,
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+    };
+    modelRegistryUpsert(this.db, row);
   }
 
-  // Read content using fs (no shell needed)
-  const content = fs.readFileSync(skillMdPath, "utf-8");
-  const skill = parseSkillMd(content, skillMdPath, "url");
-  if (!skill) {
-    throw new Error("Failed to parse fetched SKILL.md");
+  /**
+   * Enable or disable a model.
+   */
+  setEnabled(modelId: string, enabled: boolean): void {
+    modelRegistrySetEnabled(this.db, modelId, enabled);
   }
 
-  db.upsertSkill(skill);
-  return skill;
-}
-
-/**
- * Create a new skill authored by the automaton itself.
- * Uses fs.* for directory creation and file writing (no shell needed).
- */
-export async function createSkill(
-  name: string,
-  description: string,
-  instructions: string,
-  skillsDir: string,
-  db: AutomatonDatabase,
-  conway: ConwayClient,
-): Promise<Skill> {
-  // Validate name to prevent path traversal/injection
-  if (!SKILL_NAME_RE.test(name)) {
-    throw new Error(`Invalid skill name: "${name}". Must match ${SKILL_NAME_RE.source}`);
+  /**
+   * Refresh registry from Conway /v1/models API response.
+   */
+  refreshFromApi(models: any[]): void {
+    const now = new Date().toISOString();
+    for (const m of models) {
+      const existing = modelRegistryGet(this.db, m.id);
+      const row: ModelRegistryRow = {
+        modelId: m.id,
+        provider: m.provider || m.owned_by || "conway",
+        displayName: m.display_name || m.id,
+        tierMinimum: existing?.tierMinimum || "normal",
+        costPer1kInput: m.pricing?.input_per_1k ?? existing?.costPer1kInput ?? 0,
+        costPer1kOutput: m.pricing?.output_per_1k ?? existing?.costPer1kOutput ?? 0,
+        maxTokens: m.max_tokens ?? existing?.maxTokens ?? 4096,
+        contextWindow: m.context_window ?? existing?.contextWindow ?? 128000,
+        supportsTools: m.supports_tools ?? existing?.supportsTools ?? true,
+        supportsVision: m.supports_vision ?? existing?.supportsVision ?? false,
+        parameterStyle: m.parameter_style ?? existing?.parameterStyle ?? "max_tokens",
+        enabled: existing?.enabled ?? true,
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+      };
+      modelRegistryUpsert(this.db, row);
+    }
   }
 
-  // Enforce size limits
-  const safeDescription = description.slice(0, MAX_DESCRIPTION_LENGTH);
-  const safeInstructions = instructions.slice(0, MAX_INSTRUCTIONS_LENGTH);
-
-  const resolvedDir = resolveHome(skillsDir);
-  const targetDir = validateSkillPath(resolvedDir, name);
-
-  // Create directory using fs (no shell needed)
-  fs.mkdirSync(targetDir, { recursive: true });
-
-  // Generate YAML frontmatter safely using yaml.stringify (prevents YAML injection)
-  const frontmatter = yaml.stringify({
-    name,
-    description: safeDescription,
-    "auto-activate": true,
-  });
-  const content = `---\n${frontmatter}---\n\n${safeInstructions}`;
-
-  const skillMdPath = path.join(targetDir, "SKILL.md");
-  await conway.writeFile(skillMdPath, content);
-
-  const skill: Skill = {
-    name,
-    description: safeDescription,
-    autoActivate: true,
-    instructions: safeInstructions,
-    source: "self",
-    path: skillMdPath,
-    enabled: true,
-    installedAt: new Date().toISOString(),
-  };
-
-  db.upsertSkill(skill);
-  return skill;
-}
-
-/**
- * Remove a skill (disable in DB and optionally delete from disk).
- * Uses fs.rmSync for safe file deletion (no shell needed).
- */
-export async function removeSkill(
-  name: string,
-  db: AutomatonDatabase,
-  _conway: ConwayClient,
-  skillsDir: string,
-  deleteFiles: boolean = false,
-): Promise<void> {
-  // Validate name to prevent path traversal/injection
-  if (!SKILL_NAME_RE.test(name)) {
-    throw new Error(`Invalid skill name: "${name}". Must match ${SKILL_NAME_RE.source}`);
+  /**
+   * Get cost per 1k tokens for a model.
+   */
+  getCostPer1k(modelId: string): { input: number; output: number } {
+    const entry = this.get(modelId);
+    if (!entry) return { input: 0, output: 0 };
+    return { input: entry.costPer1kInput, output: entry.costPer1kOutput };
   }
 
-  db.removeSkill(name);
-
-  if (deleteFiles) {
-    const resolvedDir = resolveHome(skillsDir);
-    const targetDir = validateSkillPath(resolvedDir, name);
-    fs.rmSync(targetDir, { recursive: true, force: true });
+  private rowToEntry(row: ModelRegistryRow): ModelEntry {
+    return {
+      modelId: row.modelId,
+      provider: row.provider as ModelEntry["provider"],
+      displayName: row.displayName,
+      tierMinimum: row.tierMinimum as ModelEntry["tierMinimum"],
+      costPer1kInput: row.costPer1kInput,
+      costPer1kOutput: row.costPer1kOutput,
+      maxTokens: row.maxTokens,
+      contextWindow: row.contextWindow,
+      supportsTools: row.supportsTools,
+      supportsVision: row.supportsVision,
+      parameterStyle: row.parameterStyle as ModelEntry["parameterStyle"],
+      enabled: row.enabled,
+      lastSeen: null,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    };
   }
-}
-
-/**
- * List all installed skills.
- */
-export function listSkills(db: AutomatonDatabase): Skill[] {
-  return db.getSkills();
-}
-
-function resolveHome(p: string): string {
-  if (p.startsWith("~")) {
-    return path.join(process.env.HOME || "/root", p.slice(1));
-  }
-  return p;
 }

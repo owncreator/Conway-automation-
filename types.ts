@@ -1,155 +1,190 @@
 /**
- * Memory System Types
+ * Inference & Model Strategy — Internal Types
  *
- * Re-exports memory types from types.ts and adds internal types
- * used by the memory subsystem.
+ * Re-exports shared types from types.ts and defines internal constants
+ * for the inference routing subsystem.
  */
 
 export type {
-  WorkingMemoryType,
-  WorkingMemoryEntry,
-  TurnClassification,
-  EpisodicMemoryEntry,
-  SemanticCategory,
-  SemanticMemoryEntry,
-  ProceduralStep,
-  ProceduralMemoryEntry,
-  RelationshipMemoryEntry,
-  SessionSummaryEntry,
-  MemoryRetrievalResult,
-  MemoryBudget,
+  SurvivalTier,
+  ModelProvider,
+  InferenceTaskType,
+  ModelEntry,
+  ModelPreference,
+  RoutingMatrix,
+  InferenceRequest,
+  InferenceResult,
+  InferenceCostRow,
+  ModelRegistryRow,
+  ModelStrategyConfig,
+  ChatMessage,
 } from "../types.js";
 
-export { DEFAULT_MEMORY_BUDGET } from "../types.js";
+import type {
+  RoutingMatrix,
+  ModelEntry,
+  ModelStrategyConfig,
+} from "../types.js";
 
-import type { TurnClassification, ToolCallResult } from "../types.js";
+// === Default Retry Policy ===
 
-// ─── Internal Types ─────────────────────────────────────────────
+export const DEFAULT_RETRY_POLICY = {
+  maxRetries: 3,
+  baseDelayMs: 1000,
+  maxDelayMs: 30000,
+} as const;
 
-export interface TurnClassificationRule {
-  pattern: (toolCalls: ToolCallResult[], thinking: string) => boolean;
-  classification: TurnClassification;
-}
+// === Per-Task Timeout Overrides (ms) ===
 
-export interface MemoryIngestionConfig {
-  maxWorkingMemoryEntries: number;
-  episodicRetentionDays: number;
-  semanticMaxEntries: number;
-  enableAutoIngestion: boolean;
-}
-
-export const DEFAULT_INGESTION_CONFIG: MemoryIngestionConfig = {
-  maxWorkingMemoryEntries: 20,
-  episodicRetentionDays: 30,
-  semanticMaxEntries: 500,
-  enableAutoIngestion: true,
+export const TASK_TIMEOUTS: Record<string, number> = {
+  heartbeat_triage: 15_000,
+  safety_check: 30_000,
+  summarization: 60_000,
+  agent_turn: 120_000,
+  planning: 120_000,
 };
 
-// ─── Turn Classification ────────────────────────────────────────
+// === Static Model Baseline ===
+// Known models with realistic pricing (hundredths of cents per 1k tokens)
 
-const STRATEGIC_TOOLS = new Set([
-  "update_genesis_prompt",
-  "edit_own_file",
-  "modify_heartbeat",
-  "spawn_child",
-  "register_erc8004",
-  "update_agent_card",
-  "install_mcp_server",
-  "update_soul",
-]);
+export const STATIC_MODEL_BASELINE: Omit<ModelEntry, "lastSeen" | "createdAt" | "updatedAt">[] = [
+  {
+    modelId: "gpt-5.2",
+    provider: "openai",
+    displayName: "GPT-5.2",
+    tierMinimum: "normal",
+    costPer1kInput: 18,    // $1.75/M = 175 cents/M = 0.175 cents/1k = 17.5 hundredths ≈ 18
+    costPer1kOutput: 140,  // $14.00/M = 1400 cents/M = 1.4 cents/1k = 140 hundredths
+    maxTokens: 32768,
+    contextWindow: 1047576,
+    supportsTools: true,
+    supportsVision: true,
+    parameterStyle: "max_completion_tokens",
+    enabled: true,
+  },
+  {
+    modelId: "gpt-4.1",
+    provider: "openai",
+    displayName: "GPT-4.1",
+    tierMinimum: "normal",
+    costPer1kInput: 20,    // $2.00/M
+    costPer1kOutput: 80,   // $8.00/M
+    maxTokens: 32768,
+    contextWindow: 1047576,
+    supportsTools: true,
+    supportsVision: true,
+    parameterStyle: "max_completion_tokens",
+    enabled: true,
+  },
+  {
+    modelId: "gpt-4.1-mini",
+    provider: "openai",
+    displayName: "GPT-4.1 Mini",
+    tierMinimum: "low_compute",
+    costPer1kInput: 4,     // $0.40/M
+    costPer1kOutput: 16,   // $1.60/M
+    maxTokens: 16384,
+    contextWindow: 1047576,
+    supportsTools: true,
+    supportsVision: true,
+    parameterStyle: "max_completion_tokens",
+    enabled: true,
+  },
+  {
+    modelId: "gpt-4.1-nano",
+    provider: "openai",
+    displayName: "GPT-4.1 Nano",
+    tierMinimum: "critical",
+    costPer1kInput: 1,     // $0.10/M
+    costPer1kOutput: 4,    // $0.40/M
+    maxTokens: 16384,
+    contextWindow: 1047576,
+    supportsTools: true,
+    supportsVision: false,
+    parameterStyle: "max_completion_tokens",
+    enabled: true,
+  },
+  {
+    modelId: "gpt-5-mini",
+    provider: "openai",
+    displayName: "GPT-5 Mini",
+    tierMinimum: "low_compute",
+    costPer1kInput: 8,     // $0.80/M
+    costPer1kOutput: 32,   // $3.20/M
+    maxTokens: 16384,
+    contextWindow: 1047576,
+    supportsTools: true,
+    supportsVision: true,
+    parameterStyle: "max_completion_tokens",
+    enabled: true,
+  },
+  {
+    modelId: "gpt-5.3",
+    provider: "openai",
+    displayName: "GPT-5.3",
+    tierMinimum: "normal",
+    costPer1kInput: 20,    // $2.00/M
+    costPer1kOutput: 80,   // $8.00/M
+    maxTokens: 32768,
+    contextWindow: 1047576,
+    supportsTools: true,
+    supportsVision: true,
+    parameterStyle: "max_completion_tokens",
+    enabled: true,
+  },
+];
 
-const PRODUCTIVE_TOOLS = new Set([
-  "exec",
-  "write_file",
-  "read_file",
-  "git_commit",
-  "git_push",
-  "install_npm_package",
-  "create_sandbox",
-  "expose_port",
-  "register_domain",
-  "manage_dns",
-  "install_skill",
-  "create_skill",
-  "save_procedure",
-  "set_goal",
-]);
+// === Default Routing Matrix ===
+// Maps (tier, taskType) -> ModelPreference with candidate models
 
-const COMMUNICATION_TOOLS = new Set([
-  "send_message",
-  "check_social_inbox",
-  "give_feedback",
-  "note_about_agent",
-]);
+export const DEFAULT_ROUTING_MATRIX: RoutingMatrix = {
+  high: {
+    agent_turn: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 8192, ceilingCents: -1 },
+    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
+    safety_check: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 4096, ceilingCents: 20 },
+    summarization: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 15 },
+    planning: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 8192, ceilingCents: -1 },
+  },
+  normal: {
+    agent_turn: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: -1 },
+    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
+    safety_check: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
+    summarization: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
+    planning: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: -1 },
+  },
+  low_compute: {
+    agent_turn: { candidates: ["gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
+    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 1024, ceilingCents: 2 },
+    safety_check: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
+    summarization: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
+    planning: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
+  },
+  critical: {
+    agent_turn: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 3 },
+    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 512, ceilingCents: 1 },
+    safety_check: { candidates: ["gpt-5-mini"], maxTokens: 1024, ceilingCents: 2 },
+    summarization: { candidates: [], maxTokens: 0, ceilingCents: 0 },
+    planning: { candidates: [], maxTokens: 0, ceilingCents: 0 },
+  },
+  dead: {
+    agent_turn: { candidates: [], maxTokens: 0, ceilingCents: 0 },
+    heartbeat_triage: { candidates: [], maxTokens: 0, ceilingCents: 0 },
+    safety_check: { candidates: [], maxTokens: 0, ceilingCents: 0 },
+    summarization: { candidates: [], maxTokens: 0, ceilingCents: 0 },
+    planning: { candidates: [], maxTokens: 0, ceilingCents: 0 },
+  },
+};
 
-const MAINTENANCE_TOOLS = new Set([
-  "check_credits",
-  "check_usdc_balance",
-  "system_synopsis",
-  "heartbeat_ping",
-  "list_sandboxes",
-  "list_skills",
-  "list_children",
-  "list_models",
-  "check_reputation",
-  "git_status",
-  "git_log",
-  "git_diff",
-  "review_memory",
-  "recall_facts",
-  "recall_procedure",
-  "discover_agents",
-  "search_domains",
-]);
+// === Default Model Strategy Config ===
 
-const ERROR_KEYWORDS = ["error", "failed", "exception", "blocked", "denied"];
-
-/**
- * Classify a turn based on its tool calls and thinking content.
- * Rule-based, no inference required.
- */
-export function classifyTurn(
-  toolCalls: ToolCallResult[],
-  thinking: string,
-): TurnClassification {
-  // Error classification: any tool call with an error
-  if (toolCalls.some((tc) => tc.error)) {
-    return "error";
-  }
-
-  // Check thinking for error keywords
-  const thinkingLower = thinking.toLowerCase();
-  if (ERROR_KEYWORDS.some((kw) => thinkingLower.includes(kw)) && toolCalls.length === 0) {
-    return "error";
-  }
-
-  const toolNames = new Set(toolCalls.map((tc) => tc.name));
-
-  // Strategic: any strategic tool used
-  for (const name of toolNames) {
-    if (STRATEGIC_TOOLS.has(name)) return "strategic";
-  }
-
-  // Communication: any communication tool used
-  for (const name of toolNames) {
-    if (COMMUNICATION_TOOLS.has(name)) return "communication";
-  }
-
-  // Productive: any productive tool used
-  for (const name of toolNames) {
-    if (PRODUCTIVE_TOOLS.has(name)) return "productive";
-  }
-
-  // Maintenance: any maintenance tool used
-  for (const name of toolNames) {
-    if (MAINTENANCE_TOOLS.has(name)) return "maintenance";
-  }
-
-  // Idle: no tool calls and short thinking
-  if (toolCalls.length === 0 && thinking.length < 100) {
-    return "idle";
-  }
-
-  // Default to maintenance
-  return "maintenance";
-}
+export const DEFAULT_MODEL_STRATEGY_CONFIG: ModelStrategyConfig = {
+  inferenceModel: "gpt-5.2",
+  lowComputeModel: "gpt-5-mini",
+  criticalModel: "gpt-5-mini",
+  maxTokensPerTurn: 4096,
+  hourlyBudgetCents: 0,
+  sessionBudgetCents: 0,
+  perCallCeilingCents: 0,
+  enableModelFallback: true,
+  anthropicApiVersion: "2023-06-01",
+};

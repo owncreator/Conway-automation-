@@ -1,161 +1,180 @@
 /**
- * Automaton Configuration
+ * Heartbeat Configuration
  *
- * Loads and saves the automaton's configuration from ~/.automaton/automaton.json
+ * Parses and manages heartbeat.yml configuration.
  */
 
 import fs from "fs";
 import path from "path";
-import type { AutomatonConfig, TreasuryPolicy, ModelStrategyConfig, SoulConfig } from "./types.js";
-import { DEFAULT_CONFIG, DEFAULT_TREASURY_POLICY, DEFAULT_MODEL_STRATEGY_CONFIG, DEFAULT_SOUL_CONFIG } from "./types.js";
-import { getAutomatonDir } from "./identity/wallet.js";
-import { loadApiKeyFromConfig } from "./identity/provision.js";
-import { createLogger } from "./observability/logger.js";
-import type { ChainType } from "./identity/chain.js";
+import YAML from "yaml";
+import type { HeartbeatEntry, HeartbeatConfig, AutomatonDatabase } from "../types.js";
+import { getAutomatonDir } from "../identity/wallet.js";
+import { createLogger } from "../observability/logger.js";
 
-const logger = createLogger("config");
-const CONFIG_FILENAME = "automaton.json";
+const logger = createLogger("heartbeat.config");
 
-export function getConfigPath(): string {
-  return path.join(getAutomatonDir(), CONFIG_FILENAME);
-}
+const USDC_TOPUP_ENTRY_NAME = "check_usdc_balance";
+const USDC_TOPUP_FAST_SCHEDULE = "*/5 * * * *";
+const USDC_TOPUP_OLD_SCHEDULE = "0 */12 * * *";
+
+const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
+  entries: [
+    {
+      name: "heartbeat_ping",
+      schedule: "*/15 * * * *",
+      task: "heartbeat_ping",
+      enabled: true,
+    },
+    {
+      name: "check_credits",
+      schedule: "0 */6 * * *",
+      task: "check_credits",
+      enabled: true,
+    },
+    {
+      name: "check_usdc_balance",
+      schedule: USDC_TOPUP_FAST_SCHEDULE,
+      task: "check_usdc_balance",
+      enabled: true,
+    },
+    {
+      name: "check_for_updates",
+      schedule: "0 */4 * * *",
+      task: "check_for_updates",
+      enabled: true,
+    },
+    {
+      name: "health_check",
+      schedule: "*/30 * * * *",
+      task: "health_check",
+      enabled: true,
+    },
+    {
+      name: "check_social_inbox",
+      schedule: "*/2 * * * *",
+      task: "check_social_inbox",
+      enabled: true,
+    },
+  ],
+  defaultIntervalMs: 60_000,
+  lowComputeMultiplier: 4,
+};
 
 /**
- * Load the automaton config from disk.
- * Merges with defaults for any missing fields.
+ * Load heartbeat config from YAML file, falling back to defaults.
  */
-export function loadConfig(): AutomatonConfig | null {
-  const configPath = getConfigPath();
-  if (!fs.existsSync(configPath)) {
-    return null;
+export function loadHeartbeatConfig(configPath?: string): HeartbeatConfig {
+  const filePath =
+    configPath || path.join(getAutomatonDir(), "heartbeat.yml");
+
+  if (!fs.existsSync(filePath)) {
+    return DEFAULT_HEARTBEAT_CONFIG;
   }
 
   try {
-    const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    const apiKey = raw.conwayApiKey || loadApiKeyFromConfig();
+    const raw = fs.readFileSync(filePath, "utf-8");
+    const parsed = YAML.parse(raw) || {};
 
-    // Deep-merge treasury policy with defaults
-    const treasuryPolicy: TreasuryPolicy = {
-      ...DEFAULT_TREASURY_POLICY,
-      ...(raw.treasuryPolicy ?? {}),
-    };
+    const parsedEntries = (parsed.entries || []).map((e: any) => ({
+      name: e.name,
+      schedule: e.schedule,
+      task: e.task,
+      enabled: e.enabled !== false,
+      params: e.params,
+    })) as HeartbeatEntry[];
 
-    // Validate all treasury values are positive numbers
-    for (const [key, value] of Object.entries(treasuryPolicy)) {
-      if (key === "x402AllowedDomains") continue; // array, not number
-      if (typeof value === "number" && (value < 0 || !Number.isFinite(value))) {
-        logger.warn(`Invalid treasury value for ${key}: ${value}, using default`);
-        (treasuryPolicy as any)[key] = (DEFAULT_TREASURY_POLICY as any)[key];
-      }
-    }
-
-    // Deep-merge model strategy config with defaults
-    const modelStrategy: ModelStrategyConfig = {
-      ...DEFAULT_MODEL_STRATEGY_CONFIG,
-      ...(raw.modelStrategy ?? {}),
-    };
-
-    // Deep-merge soul config with defaults
-    const soulConfig: SoulConfig = {
-      ...DEFAULT_SOUL_CONFIG,
-      ...(raw.soulConfig ?? {}),
-    };
+    const entries = mergeWithDefaults(parsedEntries);
 
     return {
-      ...DEFAULT_CONFIG,
-      ...raw,
-      sandboxId:
-        typeof raw.sandboxId === "string"
-          ? raw.sandboxId.trim()
-          : DEFAULT_CONFIG.sandboxId,
-      conwayApiKey: apiKey,
-      treasuryPolicy,
-      modelStrategy,
-      soulConfig,
-      chainType: raw.chainType || "evm",
-    } as AutomatonConfig;
-  } catch {
-    return null;
+      entries,
+      defaultIntervalMs:
+        parsed.defaultIntervalMs ?? DEFAULT_HEARTBEAT_CONFIG.defaultIntervalMs,
+      lowComputeMultiplier:
+        parsed.lowComputeMultiplier ??
+        DEFAULT_HEARTBEAT_CONFIG.lowComputeMultiplier,
+    };
+  } catch (error: any) {
+    logger.error("Failed to parse YAML config", error instanceof Error ? error : undefined);
+    // Continue with defaults, but log the error
+    return DEFAULT_HEARTBEAT_CONFIG;
   }
 }
 
 /**
- * Save the automaton config to disk.
- * Includes treasuryPolicy in the persisted config.
+ * Save heartbeat config to YAML file.
  */
-export function saveConfig(config: AutomatonConfig): void {
-  const dir = getAutomatonDir();
+export function saveHeartbeatConfig(
+  config: HeartbeatConfig,
+  configPath?: string,
+): void {
+  const filePath =
+    configPath || path.join(getAutomatonDir(), "heartbeat.yml");
+  const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 
-  const configPath = getConfigPath();
-  const toSave = {
-    ...config,
-    treasuryPolicy: config.treasuryPolicy ?? DEFAULT_TREASURY_POLICY,
-    modelStrategy: config.modelStrategy ?? DEFAULT_MODEL_STRATEGY_CONFIG,
-    soulConfig: config.soulConfig ?? DEFAULT_SOUL_CONFIG,
-  };
-  fs.writeFileSync(configPath, JSON.stringify(toSave, null, 2), {
-    mode: 0o600,
-  });
+  fs.writeFileSync(filePath, YAML.stringify(config), { mode: 0o600 });
 }
 
 /**
- * Resolve ~ paths to absolute paths.
+ * Write the default heartbeat.yml file.
  */
-export function resolvePath(p: string): string {
-  if (p.startsWith("~")) {
-    return path.join(process.env.HOME || "/root", p.slice(1));
+export function writeDefaultHeartbeatConfig(configPath?: string): void {
+  saveHeartbeatConfig(DEFAULT_HEARTBEAT_CONFIG, configPath);
+}
+
+/**
+ * Sync heartbeat entries from YAML config into the database.
+ */
+export function syncHeartbeatToDb(
+  config: HeartbeatConfig,
+  db: AutomatonDatabase,
+): void {
+  for (const entry of config.entries) {
+    db.upsertHeartbeatEntry(entry);
   }
-  return p;
 }
 
-/**
- * Create a fresh config from setup wizard inputs.
- */
-export function createConfig(params: {
-  name: string;
-  genesisPrompt: string;
-  creatorMessage?: string;
-  creatorAddress: string;
-  registeredWithConway: boolean;
-  sandboxId: string;
-  walletAddress: string;
-  apiKey: string;
-  openaiApiKey?: string;
-  anthropicApiKey?: string;
-  ollamaBaseUrl?: string;
-  parentAddress?: string;
-  treasuryPolicy?: TreasuryPolicy;
-  chainType?: ChainType;
-}): AutomatonConfig {
-  const normalizedSandboxId = (params.sandboxId || "").trim();
-  return {
-    name: params.name,
-    genesisPrompt: params.genesisPrompt,
-    creatorMessage: params.creatorMessage,
-    creatorAddress: params.creatorAddress,
-    registeredWithConway: params.registeredWithConway,
-    sandboxId: normalizedSandboxId,
-    conwayApiUrl:
-      DEFAULT_CONFIG.conwayApiUrl || "https://api.conway.tech",
-    conwayApiKey: params.apiKey,
-    openaiApiKey: params.openaiApiKey,
-    anthropicApiKey: params.anthropicApiKey,
-    ollamaBaseUrl: params.ollamaBaseUrl,
-    inferenceModel: DEFAULT_CONFIG.inferenceModel || "gpt-5.2",
-    maxTokensPerTurn: DEFAULT_CONFIG.maxTokensPerTurn || 4096,
-    heartbeatConfigPath:
-      DEFAULT_CONFIG.heartbeatConfigPath || "~/.automaton/heartbeat.yml",
-    dbPath: DEFAULT_CONFIG.dbPath || "~/.automaton/state.db",
-    logLevel: (DEFAULT_CONFIG.logLevel as AutomatonConfig["logLevel"]) || "info",
-    walletAddress: params.walletAddress,
-    version: DEFAULT_CONFIG.version || "0.2.1",
-    skillsDir: DEFAULT_CONFIG.skillsDir || "~/.automaton/skills",
-    maxChildren: DEFAULT_CONFIG.maxChildren || 3,
-    parentAddress: params.parentAddress,
-    treasuryPolicy: params.treasuryPolicy ?? DEFAULT_TREASURY_POLICY,
-    chainType: params.chainType || "evm",
-  };
+function mergeWithDefaults(entries: HeartbeatEntry[]): HeartbeatEntry[] {
+  const defaults = DEFAULT_HEARTBEAT_CONFIG.entries.map((entry) => ({ ...entry }));
+  const defaultsByName = new Map(defaults.map((entry) => [entry.name, entry]));
+  const mergedByName = new Map(defaultsByName);
+
+  for (const entry of entries) {
+    if (!entry?.name) continue;
+    const fallback = defaultsByName.get(entry.name);
+    mergedByName.set(entry.name, {
+      ...(fallback || {}),
+      ...entry,
+      enabled: entry.enabled !== false,
+      task: entry.task || fallback?.task || "",
+      schedule: entry.schedule || fallback?.schedule || "",
+    });
+  }
+
+  const fallbackTopup = defaultsByName.get(USDC_TOPUP_ENTRY_NAME);
+  if (fallbackTopup) {
+    const current = mergedByName.get(USDC_TOPUP_ENTRY_NAME) || fallbackTopup;
+    const migratedSchedule = current.schedule?.trim() === USDC_TOPUP_OLD_SCHEDULE
+      ? USDC_TOPUP_FAST_SCHEDULE
+      : current.schedule || fallbackTopup.schedule;
+
+    mergedByName.set(USDC_TOPUP_ENTRY_NAME, {
+      ...fallbackTopup,
+      ...current,
+      task: current.task || fallbackTopup.task,
+      schedule: migratedSchedule,
+    });
+  }
+
+  const orderedDefaultEntries = defaults.map(
+    (defaultEntry) => mergedByName.get(defaultEntry.name) || defaultEntry,
+  );
+  const knownNames = new Set(defaults.map((entry) => entry.name));
+  const customEntries = [...mergedByName.values()].filter(
+    (entry) => !knownNames.has(entry.name),
+  );
+
+  return [...orderedDefaultEntries, ...customEntries];
 }
