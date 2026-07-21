@@ -1,32 +1,42 @@
+#!/usr/bin/env node
 /**
- * Policy Rules Registry
+ * Conway Automaton CLI
  *
- * Central registry for all policy rules. Aggregates rules from
- * each sub-phase module.
+ * Creator-facing CLI for interacting with an automaton.
+ * Usage: automaton-cli <command> [args]
  */
 
-import type { PolicyRule, TreasuryPolicy } from "../../types.js";
-import { DEFAULT_TREASURY_POLICY } from "../../types.js";
-import { createValidationRules } from "./validation.js";
-import { createCommandSafetyRules } from "./command-safety.js";
-import { createPathProtectionRules } from "./path-protection.js";
-import { createFinancialRules } from "./financial.js";
-import { createAuthorityRules } from "./authority.js";
-import { createRateLimitRules } from "./rate-limits.js";
+const args = process.argv.slice(2);
+const command = args[0];
 
-/**
- * Create the default set of policy rules.
- * Each sub-phase adds its rules here.
- */
-export function createDefaultRules(
-  treasuryPolicy: TreasuryPolicy = DEFAULT_TREASURY_POLICY,
-): PolicyRule[] {
-  return [
-    ...createValidationRules(),
-    ...createCommandSafetyRules(),
-    ...createPathProtectionRules(),
-    ...createFinancialRules(treasuryPolicy),
-    ...createAuthorityRules(),
-    ...createRateLimitRules(),
-  ];
+async function main(): Promise<void> {
+  switch (command) {
+    case "status":
+      await import("./commands/status.js");
+      break;
+    case "logs":
+      await import("./commands/logs.js");
+      break;
+    case "fund":
+      await import("./commands/fund.js");
+      break;
+    case "send":
+      await import("./commands/send.js");
+      break;
+    default:
+      console.log(`
+Conway Automaton CLI - Creator Tools
+
+Usage:
+  automaton-cli status              Show automaton status
+  automaton-cli logs [--tail N]     View automaton logs
+  automaton-cli fund <amount> [--to 0x...]  Transfer Conway credits
+  automaton-cli send <to-address> <message> Send a social message
+`);
+  }
 }
+
+main().catch((err) => {
+  console.error(`Error: ${err.message}`);
+  process.exit(1);
+});
